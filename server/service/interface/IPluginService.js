@@ -2,12 +2,19 @@ import os from 'os'
 import fs from 'fs'
 import path from 'path'
 import lodash from 'lodash'
-import fetch from 'node-fetch'
+import nodeFetch from 'node-fetch'
 import {exec, spawn} from 'child_process'
 import {Service} from '#guoba.framework';
 import {cfg, Constant, GuobaSupportMap, PluginsMap} from '#guoba.platform';
 import {BotActions} from '#guoba.utils'
 import {parsePluginsIndexByLocal, parseReadmeLink} from '../../helper/pluginsIndex.js'
+import {
+  buildReadmeBaseUrl,
+  buildReadmeCandidates,
+  fetchReadmeFromRemote,
+  findLocalReadme,
+  parsePluginRepo,
+} from '../../helper/readme.js'
 import {getPluginIconPath, parseShowInMenu} from '../../utils/pluginUtils.js'
 
 export default class IPluginService extends Service {
@@ -163,40 +170,45 @@ export default class IPluginService extends Service {
     return remotePlugins
   }
 
+  /**
+   * 获取插件 README
+   * 优先读取本地已安装插件的 README，本地不存在时再从远程仓库获取
+   * @param link 插件链接
+   * @param force 是否跳过缓存强制刷新
+   * @return {Promise<string>}
+   */
   async getReadmeText(link, force = false) {
     let redisKey = Constant.REDIS_PREFIX + 'plugin:readme:' + link
-    let text = null
-    if (!force) {
-      text = await redis.get(redisKey)
+    const repo = parsePluginRepo(link)
+    const proxyUrl = cfg.get('base.githubReverseProxy') ? cfg.get('base.githubProxyUrl') : ''
+    // 已安装的插件直接读取本地 README，无需网络，也不会受 GitHub 访问异常影响
+    if (repo) {
+      const localReadme = findLocalReadme(this.pluginsPath, repo.repo)
+      if (localReadme) {
+        return parseReadmeLink(localReadme.text, buildReadmeBaseUrl(repo, proxyUrl))
+      }
     }
-    if (text) {
+    if (!force) {
+      const cachedText = await redis.get(redisKey)
+      if (cachedText) {
+        return cachedText
+      }
+    }
+    if (!repo) {
+      return ''
+    }
+    // 远程获取，支持 GitHub 反代、国内镜像与超时回退
+    const candidates = buildReadmeCandidates(repo, proxyUrl)
+    const fetchImpl = typeof globalThis.fetch === 'function' ? globalThis.fetch : nodeFetch
+    const result = await fetchReadmeFromRemote(candidates, fetchImpl)
+    if (result.text) {
+      const text = parseReadmeLink(result.text, result.baseUrl)
+      await redis.set(redisKey, text, {EX: 3600 * 12})
       return text
     }
-    let arr = link.split('/')
-    let name = (arr.pop() || '').trim().replace(/\.git$/, '')
-    let author = arr.pop()
-    let url = ''
-    if (/github\.com/i.test(link)) {
-      url = `https://raw.githubusercontent.com/${author}/${name}/{branch}`
-    } else if (/gitee\.com/i.test(link)) {
-      url = `https://gitee.com/${author}/${name}/raw/{branch}`
-    }
-    if (url) {
-      let baseUrl = ''
-      let branches = ['master', 'main']
-      for (let branch of branches) {
-        baseUrl = url.replace('{branch}', branch)
-        let response = await fetch(`${baseUrl}/README.md`)
-        if (response.status === 200) {
-          text = await response.text()
-          break
-        }
-      }
-      if (text) {
-        text = parseReadmeLink(text, baseUrl)
-        redis.set(redisKey, text, {EX: 3600 * 12})
-        return text
-      }
+    if (result.failures.length > 0) {
+      const lastFailure = result.failures[result.failures.length - 1]
+      logger.warn(`[Guoba] 获取插件 README 失败（${link}），最后尝试地址：${lastFailure.url}，原因：${lastFailure.reason}`)
     }
     return ''
   }

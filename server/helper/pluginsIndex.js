@@ -221,7 +221,7 @@ export function parseReadmeLink(text, baseUrl) {
       url = `${_paths.server.realMountPrefix}/api/helper/transit?url=${encodeURIComponent($1)}`
       return $0.replace($1, url)
     }
-    if (/^https?/i.test($1)) {
+    if (/^(?:[a-z][a-z0-9+.-]*:|\/\/|#)/i.test($1)) {
       return $0
     }
     url = `${baseUrl}/${$1.replace(/^\//, '')}`
